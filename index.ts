@@ -35,7 +35,8 @@ interface SSHHostConfig {
 }
 
 const sshHosts = new Map<string, SSHHostConfig>();
-const SSH_PRIVATE_KEY = process.env.SSH_PRIVATE_KEY || "";
+const SSH_PRIVATE_KEY = process.env.SSH_PRIVATE_KEY
+  || (process.env.SSH_PRIVATE_KEY_B64 ? Buffer.from(process.env.SSH_PRIVATE_KEY_B64, "base64").toString("utf-8") : "");
 
 function parseSSHHosts(): void {
   const hostsEnv = process.env.SSH_HOSTS || "";
