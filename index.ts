@@ -778,6 +778,100 @@ server.tool(
   }
 );
 
+// restart-node
+server.tool(
+  {
+    name: "restart-node",
+    description: "Restart a running BEAM node (stop then re-launch with the same config)",
+    schema: z.object({
+      name: z.string().describe("Short name of the node to restart"),
+    }),
+  },
+  async ({ name }) => {
+    const guard = configGuard();
+    if (guard) return guard;
+
+    const node = nodes.get(name);
+    if (!node) {
+      return error(`Node "${name}" not found. Use list-nodes to see active nodes.`);
+    }
+
+    const { hostLabel, type, cookie } = node;
+    const hostConfig = sshHosts.get(hostLabel);
+    if (!hostConfig) {
+      return error(`SSH host "${hostLabel}" no longer configured.`);
+    }
+
+    // Stop the existing node
+    try { node.channel.close(); } catch {}
+    nodes.delete(name);
+
+    // Re-launch with the same config
+    let conn: Client;
+    try {
+      conn = await getSSHConnection(hostLabel);
+    } catch (err) {
+      return error(`Failed to connect to SSH host "${hostLabel}": ${err instanceof Error ? err.message : "Unknown error"}`);
+    }
+
+    const shortHost = hostConfig.remoteShortHost;
+    const pathPrefix = pathPrefixFor(hostConfig);
+    let command: string;
+    if (type === "erlang") {
+      command = `${pathPrefix}${hostConfig.erlPath} -sname ${name} -setcookie ${cookie} -noshell`;
+    } else {
+      command = `${pathPrefix}${hostConfig.elixirPath} --sname ${name} --cookie ${cookie} --no-halt`;
+    }
+
+    let channel: ClientChannel;
+    try {
+      channel = await sshExecLongRunning(conn, command);
+    } catch (err) {
+      return error(`Failed to restart node on "${hostLabel}": ${err instanceof Error ? err.message : "Unknown error"}`);
+    }
+
+    const newNode: ManagedNode = {
+      channel,
+      hostLabel,
+      remoteShortHost: shortHost,
+      type,
+      startedAt: Date.now(),
+      cookie,
+      name,
+      status: "starting",
+    };
+    nodes.set(name, newNode);
+
+    channel.on("close", () => {
+      const n = nodes.get(name);
+      if (n) n.status = "stopped";
+    });
+
+    // Ping after 2s to confirm the node is reachable
+    setTimeout(async () => {
+      const n = nodes.get(name);
+      if (!n || n.status === "stopped") return;
+      try {
+        const pingConn = await getSSHConnection(hostLabel);
+        const tmpName = `mcpchk_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+        const fullTarget = `${name}@${shortHost}`;
+        const evalCode = `case net_adm:ping('${fullTarget}') of pong -> io:format("pong"), init:stop(0); pang -> io:format("pang"), init:stop(1) end.`;
+        const pingCmd = `${pathPrefix}${hostConfig.erlPath} -sname ${tmpName} -setcookie ${cookie} -noshell -eval ${shellEscape(evalCode)}`;
+        const result = await sshExecSimple(pingConn, pingCmd, 5000);
+        const nn = nodes.get(name);
+        if (nn && nn.status === "starting") {
+          nn.status = result.trim() === "pong" ? "running" : "error";
+        }
+      } catch {
+        const nn = nodes.get(name);
+        if (nn) nn.status = "error";
+      }
+    }, 2000);
+
+    return text(`Restarted ${type} node "${name}@${shortHost}" on host "${hostLabel}". Status will update to "running" in ~2s after ping check.`);
+  }
+);
+
 // ── Start ───────────────────────────────────────────────────────────────────
 
 const PORT = process.env.PORT ? parseInt(process.env.PORT) : 3000;
