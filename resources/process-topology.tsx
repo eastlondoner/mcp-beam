@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from "react";
-import { McpUseProvider, useWidget, useCallTool, type WidgetMetadata } from "mcp-use/react";
+import { McpUseProvider, useWidget, useCallTool, useWidgetTheme, type WidgetMetadata } from "mcp-use/react";
 import { z } from "zod";
 
 const propsSchema = z.object({
@@ -70,9 +70,25 @@ function computeLayout(names: string[]): NodePos[] {
 
 export default function ProcessTopology() {
   const { props, isPending } = useWidget<Props>();
+  const theme = useWidgetTheme();
   const { callToolAsync: startTrace } = useCallTool("start-trace");
   const { callToolAsync: stopTrace } = useCallTool("stop-trace");
   const { callToolAsync: pollTrace } = useCallTool("poll-trace");
+
+  const isDark = theme === "dark";
+  const colors = {
+    text:           isDark ? "#e0e0e0" : "#374151",
+    textSecondary:  isDark ? "#b0b0b0" : "#888888",
+    canvasBg:       isDark ? "#1a1a1a" : "#ffffff",
+    edge:           isDark ? "#555555" : "#d1d5db",
+    edgeHover:      isDark ? "#9ca3af" : "#9ca3af",
+    tooltipBg:      isDark ? "rgba(30,30,30,0.95)" : "rgba(255,255,255,0.95)",
+    tooltipBorder:  isDark ? "#555555" : "#d1d5db",
+    border:         isDark ? "#404040" : "#e5e7eb",
+    buttonBg:       isDark ? "#2a2a2a" : "#ffffff",
+    buttonBorder:   isDark ? "#404040" : "#d1d5db",
+    buttonText:     isDark ? "#e0e0e0" : "#374151",
+  };
 
   const [tracing, setTracing] = useState(false);
   const [traceEdges, setTraceEdges] = useState<Props["traceEdges"]>([]);
@@ -158,6 +174,8 @@ export default function ProcessTopology() {
     ctx.scale(dpr, dpr);
 
     ctx.clearRect(0, 0, CANVAS_W, CANVAS_H);
+    ctx.fillStyle = colors.canvasBg;
+    ctx.fillRect(0, 0, CANVAS_W, CANVAS_H);
 
     const positions = positionsRef.current;
     const posMap = new Map<string, NodePos>();
@@ -174,7 +192,7 @@ export default function ProcessTopology() {
       ctx.beginPath();
       ctx.moveTo(from.x, from.y);
       ctx.lineTo(to.x, to.y);
-      ctx.strokeStyle = isHovered ? "#9ca3af" : "#d1d5db";
+      ctx.strokeStyle = isHovered ? colors.edgeHover : colors.edge;
       ctx.lineWidth = isHovered ? 1.5 : 1;
       if (edge.type === "monitor") {
         ctx.setLineDash([4, 4]);
@@ -200,7 +218,7 @@ export default function ProcessTopology() {
           ctx.lineTo(tipX - arrowLen * ux + 4 * uy, tipY - arrowLen * uy - 4 * ux);
           ctx.lineTo(tipX - arrowLen * ux - 4 * uy, tipY - arrowLen * uy + 4 * ux);
           ctx.closePath();
-          ctx.fillStyle = isHovered ? "#9ca3af" : "#d1d5db";
+          ctx.fillStyle = isHovered ? colors.edgeHover : colors.edge;
           ctx.fill();
         }
       }
@@ -252,7 +270,7 @@ export default function ProcessTopology() {
       }
 
       // Label
-      ctx.fillStyle = "#374151";
+      ctx.fillStyle = colors.text;
       ctx.font = `${isHovered ? "bold " : ""}11px system-ui, -apple-system, sans-serif`;
       ctx.textAlign = "center";
       ctx.fillText(
@@ -285,15 +303,15 @@ export default function ProcessTopology() {
         if (ty < 0) ty = 4;
         if (ty + tooltipH > CANVAS_H) ty = CANVAS_H - tooltipH - 4;
 
-        ctx.fillStyle = "rgba(255,255,255,0.95)";
-        ctx.strokeStyle = "#d1d5db";
+        ctx.fillStyle = colors.tooltipBg;
+        ctx.strokeStyle = colors.tooltipBorder;
         ctx.lineWidth = 1;
         ctx.beginPath();
         ctx.roundRect(tx, ty, tooltipW, tooltipH, 6);
         ctx.fill();
         ctx.stroke();
 
-        ctx.fillStyle = "#374151";
+        ctx.fillStyle = colors.text;
         ctx.font = "bold 11px system-ui, -apple-system, sans-serif";
         ctx.textAlign = "left";
         ctx.fillText(lines[0], tx + padding, ty + padding + 12);
@@ -303,7 +321,7 @@ export default function ProcessTopology() {
         }
       }
     }
-  }, [localNodes, localEdges, traceEdges, hoveredNode, tracing]);
+  }, [localNodes, localEdges, traceEdges, hoveredNode, tracing, colors.canvasBg, colors.text, colors.edge, colors.edgeHover, colors.tooltipBg, colors.tooltipBorder]);
 
   // Animation loop (only when tracing for dash animation)
   useEffect(() => {
@@ -368,7 +386,7 @@ export default function ProcessTopology() {
   if (isPending) {
     return (
       <McpUseProvider autoSize>
-        <div style={{ padding: 20, color: "#888" }}>Building topology graph...</div>
+        <div style={{ padding: 20, color: colors.textSecondary }}>Building topology graph...</div>
       </McpUseProvider>
     );
   }
@@ -386,10 +404,10 @@ export default function ProcessTopology() {
         {/* Header */}
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
           <div>
-            <span style={{ fontFamily: "monospace", fontWeight: 700, fontSize: 18 }}>
+            <span style={{ fontFamily: "monospace", fontWeight: 700, fontSize: 18, color: colors.text }}>
               {nodeName}
             </span>
-            <span style={{ fontSize: 13, color: "#888", marginLeft: 8 }}>
+            <span style={{ fontSize: 13, color: colors.textSecondary, marginLeft: 8 }}>
               {localNodes.length} processes &middot; {localEdges.length} edges
             </span>
           </div>
@@ -403,9 +421,9 @@ export default function ProcessTopology() {
               padding: "6px 14px",
               borderRadius: 6,
               border: "1px solid",
-              borderColor: tracing ? "#ef4444" : "#d1d5db",
-              background: tracing ? "#fef2f2" : "#fff",
-              color: tracing ? "#dc2626" : "#374151",
+              borderColor: tracing ? "#ef4444" : colors.buttonBorder,
+              background: tracing ? "#fef2f2" : colors.buttonBg,
+              color: tracing ? "#dc2626" : colors.buttonText,
               fontSize: 13,
               fontWeight: 500,
               cursor: toggling ? "wait" : "pointer",
@@ -436,20 +454,20 @@ export default function ProcessTopology() {
             width: "100%",
             maxWidth: CANVAS_W,
             height: "auto",
-            border: "1px solid #e5e7eb",
+            border: `1px solid ${colors.border}`,
             borderRadius: 8,
             cursor: hoveredNode ? "pointer" : "default",
           }}
         />
 
         {/* Legend */}
-        <div style={{ display: "flex", gap: 16, marginTop: 10, fontSize: 12, color: "#6b7280", flexWrap: "wrap" }}>
+        <div style={{ display: "flex", gap: 16, marginTop: 10, fontSize: 12, color: colors.textSecondary, flexWrap: "wrap" }}>
           <span style={{ display: "flex", alignItems: "center", gap: 4 }}>
-            <span style={{ width: 20, height: 2, background: "#d1d5db", display: "inline-block" }} />
+            <span style={{ width: 20, height: 2, background: colors.edge, display: "inline-block" }} />
             Link
           </span>
           <span style={{ display: "flex", alignItems: "center", gap: 4 }}>
-            <span style={{ width: 20, height: 0, borderTop: "2px dashed #d1d5db", display: "inline-block" }} />
+            <span style={{ width: 20, height: 0, borderTop: `2px dashed ${colors.edge}`, display: "inline-block" }} />
             Monitor
           </span>
           {tracing && (
@@ -477,7 +495,7 @@ export default function ProcessTopology() {
         </div>
 
         {localNodes.length === 0 && (
-          <div style={{ padding: 40, textAlign: "center", color: "#888" }}>
+          <div style={{ padding: 40, textAlign: "center", color: colors.textSecondary }}>
             No registered processes found on this node.
           </div>
         )}
