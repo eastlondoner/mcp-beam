@@ -418,6 +418,42 @@ server.tool(
   }
 );
 
+// ── Shared node-list helper ──────────────────────────────────────────────
+
+async function gatherNodeList() {
+  const nodeList: Array<{
+    name: string;
+    type: "erlang" | "elixir";
+    status: string;
+    startedAt: number;
+    processCount: number | null;
+  }> = [];
+
+  for (const [name, node] of nodes) {
+    let processCount: number | null = null;
+
+    if (node.status === "running") {
+      try {
+        const result = await rpcCall(name, node.cookie, "erlang:system_info(process_count)", node.hostLabel);
+        const parsed = parseInt(result, 10);
+        if (!isNaN(parsed)) processCount = parsed;
+      } catch {
+        // Node might have become unreachable
+      }
+    }
+
+    nodeList.push({
+      name,
+      type: node.type,
+      status: node.status,
+      startedAt: node.startedAt,
+      processCount,
+    });
+  }
+
+  return nodeList;
+}
+
 // list-nodes
 server.tool(
   {
@@ -434,35 +470,7 @@ server.tool(
     const guard = configGuard();
     if (guard) return guard;
 
-    const nodeList: Array<{
-      name: string;
-      type: "erlang" | "elixir";
-      status: string;
-      startedAt: number;
-      processCount: number | null;
-    }> = [];
-
-    for (const [name, node] of nodes) {
-      let processCount: number | null = null;
-
-      if (node.status === "running") {
-        try {
-          const result = await rpcCall(name, node.cookie, "erlang:system_info(process_count)", node.hostLabel);
-          const parsed = parseInt(result, 10);
-          if (!isNaN(parsed)) processCount = parsed;
-        } catch {
-          // Node might have become unreachable
-        }
-      }
-
-      nodeList.push({
-        name,
-        type: node.type,
-        status: node.status,
-        startedAt: node.startedAt,
-        processCount,
-      });
-    }
+    const nodeList = await gatherNodeList();
 
     const summary = nodeList.length === 0
       ? "No managed nodes."
@@ -471,6 +479,35 @@ server.tool(
     return widget({
       props: { nodes: nodeList },
       output: text(`Managed nodes: ${summary}`),
+    });
+  }
+);
+
+// show-cluster (exposes the dashboard widget as a tool for agents that don't support resources)
+server.tool(
+  {
+    name: "show-cluster",
+    description: "Show an interactive cluster visualization of all managed BEAM nodes. Use this to display the visual node dashboard.",
+    schema: z.object({}),
+    widget: {
+      name: "node-dashboard",
+      invoking: "Loading cluster visualization...",
+      invoked: "Cluster visualization ready",
+    },
+  },
+  async () => {
+    const guard = configGuard();
+    if (guard) return guard;
+
+    const nodeList = await gatherNodeList();
+
+    const summary = nodeList.length === 0
+      ? "No managed nodes."
+      : `${nodeList.length} node(s): ` + nodeList.map((n) => `${n.name} (${n.status})`).join(", ");
+
+    return widget({
+      props: { nodes: nodeList },
+      output: text(summary),
     });
   }
 );

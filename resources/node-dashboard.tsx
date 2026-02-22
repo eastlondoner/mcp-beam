@@ -25,7 +25,7 @@ const propsSchema = z.object({
 export const widgetMetadata: WidgetMetadata = {
   description: "Cluster visualization showing BEAM nodes as animated orbs with inline process inspection",
   props: propsSchema,
-  exposeAsTool: false,
+  exposeAsTool: true,
 };
 
 type Props = z.infer<typeof propsSchema>;
