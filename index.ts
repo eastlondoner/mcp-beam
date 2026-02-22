@@ -1427,7 +1427,7 @@ server.tool(
     if (node.status !== "running") return error(`Node "${name}" is not running.`);
 
     // Topology + trace data in one RPC
-    const erlCode = topologyErlCode().replace("ok", `
+    const erlCode = topologyErlCode().replace(/ok\s*$/, `
       case ets:info(mcp_trace_edges) of
         undefined -> ok;
         _ ->
