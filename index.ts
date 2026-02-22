@@ -36,10 +36,11 @@ if (API_KEY) {
       return;
     }
 
-    // Otherwise require API key (header or query string)
-    const auth = c.req.header("Authorization");
+    // Otherwise require API key (header, raw header, or query string)
+    const auth = c.req.header("Authorization") || "";
     const queryKey = new URL(c.req.url).searchParams.get("api_key");
-    if (auth !== `Bearer ${API_KEY}` && queryKey !== API_KEY) {
+    const keyMatch = auth === `Bearer ${API_KEY}` || auth === API_KEY || queryKey === API_KEY;
+    if (!keyMatch) {
       return c.json({ error: "Forbidden" }, 403);
     }
 
