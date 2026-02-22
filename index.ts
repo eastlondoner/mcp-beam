@@ -26,13 +26,29 @@ const server = new MCPServer({
 const API_KEY = process.env.API_KEY || "";
 
 if (API_KEY) {
+  const authenticatedSessions = new Set<string>();
+
   server.app.use("/mcp/*", async (c, next) => {
+    // Requests with a known session ID are already authenticated
+    const sessionId = c.req.header("Mcp-Session-Id");
+    if (sessionId && authenticatedSessions.has(sessionId)) {
+      await next();
+      return;
+    }
+
+    // Otherwise require API key (header or query string)
     const auth = c.req.header("Authorization");
     const queryKey = new URL(c.req.url).searchParams.get("api_key");
-    if (auth === `Bearer ${API_KEY}` || queryKey === API_KEY) {
-      await next();
-    } else {
+    if (auth !== `Bearer ${API_KEY}` && queryKey !== API_KEY) {
       return c.json({ error: "Unauthorized" }, 401);
+    }
+
+    await next();
+
+    // Capture the session ID from the response so future requests pass through
+    const newSessionId = c.res.headers.get("Mcp-Session-Id");
+    if (newSessionId) {
+      authenticatedSessions.add(newSessionId);
     }
   });
 }
