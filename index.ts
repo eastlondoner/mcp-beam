@@ -21,6 +21,20 @@ const server = new MCPServer({
   ],
 });
 
+// ── Well-Known Endpoints ─────────────────────────────────────────────────────
+// MCP clients probe these to discover auth. Return empty/valid responses so
+// clients don't treat 404 as an auth error.
+
+server.app.get("/.well-known/oauth-authorization-server", (c) =>
+  c.json({ issuer: new URL(c.req.url).origin }, 200)
+);
+server.app.get("/.well-known/oauth-protected-resource", (c) =>
+  c.json({ resource: new URL(c.req.url).origin }, 200)
+);
+server.app.get("/.well-known/openid-configuration", (c) =>
+  c.json({ issuer: new URL(c.req.url).origin }, 200)
+);
+
 // ── API Key Guard ────────────────────────────────────────────────────────────
 
 const API_KEY = process.env.API_KEY || "";
