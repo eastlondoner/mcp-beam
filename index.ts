@@ -21,6 +21,20 @@ const server = new MCPServer({
   ],
 });
 
+// ── API Key Guard ────────────────────────────────────────────────────────────
+
+const API_KEY = process.env.API_KEY || "";
+
+if (API_KEY) {
+  server.app.use("/mcp/*", async (c, next) => {
+    const auth = c.req.header("Authorization");
+    if (!auth || auth !== `Bearer ${API_KEY}`) {
+      return c.json({ error: "Unauthorized" }, 401);
+    }
+    await next();
+  });
+}
+
 // ── SSH Host Configuration ──────────────────────────────────────────────────
 
 interface SSHHostConfig {
@@ -225,6 +239,16 @@ function clearTrackedForNode(nodeName: string): void {
   }
 }
 
+// ── Trace Session Tracking ──────────────────────────────────────────────────
+
+interface TraceSession {
+  nodeName: string;
+  hostLabel: string;
+  startedAt: number;
+}
+
+const activeTraces = new Map<string, TraceSession>();
+
 function getDefaultHostLabel(): string | null {
   const first = sshHosts.keys().next();
   return first.done ? null : first.value;
@@ -254,6 +278,7 @@ function cleanup() {
   for (const [, node] of nodes) {
     try { node.channel.close(); } catch {}
   }
+  activeTraces.clear();
   for (const [, hostConfig] of sshHosts) {
     try { hostConfig.connection?.end(); } catch {}
     hostConfig.connection = null;
@@ -432,6 +457,7 @@ server.tool(
     try { node.channel.close(); } catch {}
     nodes.delete(name);
     clearTrackedForNode(name);
+    activeTraces.delete(name);
 
     return text(`Stopped and removed node "${name}@${node.remoteShortHost}" on host "${node.hostLabel}".`);
   }
@@ -996,6 +1022,7 @@ server.tool(
     try { node.channel.close(); } catch {}
     nodes.delete(name);
     clearTrackedForNode(name);
+    activeTraces.delete(name);
 
     // Re-launch with the same config
     let conn: Client;
@@ -1060,6 +1087,379 @@ server.tool(
     }, 2000);
 
     return text(`Restarted ${type} node "${name}@${shortHost}" on host "${hostLabel}". Status will update to "running" in ~2s after ping check.`);
+  }
+);
+
+// ── Topology & Tracing Tools ────────────────────────────────────────────────
+
+// Shared Erlang code for gathering topology (registered processes with links/monitors)
+function topologyErlCode(): string {
+  return `
+    Names = erlang:registered(),
+    lists:foreach(fun(N) ->
+      Pid = whereis(N),
+      case Pid of
+        undefined -> ok;
+        _ ->
+          Info = erlang:process_info(Pid, [status, message_queue_len, memory, current_function, links, monitored_by, monitors]),
+          case Info of
+            undefined -> ok;
+            _ ->
+              Status = proplists:get_value(status, Info),
+              MQL = proplists:get_value(message_queue_len, Info),
+              Mem = proplists:get_value(memory, Info),
+              {M, F, A} = proplists:get_value(current_function, Info),
+              Links = proplists:get_value(links, Info, []),
+              MonBy = proplists:get_value(monitored_by, Info, []),
+              Mons = proplists:get_value(monitors, Info, []),
+              ResolveName = fun(P) ->
+                case is_pid(P) of
+                  true ->
+                    case lists:filter(fun(Reg) -> whereis(Reg) =:= P end, Names) of
+                      [RegName|_] -> atom_to_list(RegName);
+                      [] -> ""
+                    end;
+                  false when is_atom(P) -> atom_to_list(P);
+                  false -> ""
+                end
+              end,
+              LinkNames = [ResolveName(L) || L <- Links, ResolveName(L) =/= ""],
+              MonByNames = [ResolveName(L) || L <- MonBy, ResolveName(L) =/= ""],
+              MonNames = lists:filtermap(fun({process, P}) -> case ResolveName(P) of "" -> false; V -> {true, V} end; (_) -> false end, Mons),
+              io:format("PROC|~s|~s|~p|~p|~s:~s/~p|~s|~s|~s~n", [
+                atom_to_list(N),
+                atom_to_list(Status),
+                MQL, Mem,
+                atom_to_list(M), atom_to_list(F), A,
+                string:join(LinkNames, ","),
+                string:join(MonByNames, ","),
+                string:join(MonNames, ",")
+              ])
+          end
+      end
+    end, Names),
+    ok
+  `.replace(/\n/g, " ");
+}
+
+interface GraphNode {
+  name: string;
+  status: string;
+  messageQueueLen: number;
+  memory: number;
+  currentFunction: string;
+  type: "genserver" | "supervisor" | "genstatem" | "system";
+}
+
+interface GraphEdge {
+  from: string;
+  to: string;
+  type: "link" | "monitor";
+}
+
+interface TraceEdge {
+  from: string;
+  to: string;
+  count: number;
+}
+
+function parseTopologyOutput(output: string): { graphNodes: GraphNode[]; edges: GraphEdge[] } {
+  const graphNodes: GraphNode[] = [];
+  const edges: GraphEdge[] = [];
+  const seenLinkPairs = new Set<string>();
+
+  for (const line of output.split("\n")) {
+    if (!line.startsWith("PROC|")) continue;
+    const parts = line.split("|");
+    if (parts.length < 9) continue;
+
+    const [, name, status, mqLen, mem, currentFn, linksStr, monByStr, monsStr] = parts;
+    graphNodes.push({
+      name,
+      status,
+      messageQueueLen: parseInt(mqLen, 10) || 0,
+      memory: parseInt(mem, 10) || 0,
+      currentFunction: currentFn,
+      type: classifyProcess(currentFn),
+    });
+
+    // Links (bidirectional — only emit one edge per pair)
+    if (linksStr) {
+      for (const linked of linksStr.split(",").filter(Boolean)) {
+        const key = [name, linked].sort().join("|");
+        if (!seenLinkPairs.has(key)) {
+          seenLinkPairs.add(key);
+          edges.push({ from: name, to: linked, type: "link" });
+        }
+      }
+    }
+
+    // Monitored-by (someone monitors this process)
+    if (monByStr) {
+      for (const mon of monByStr.split(",").filter(Boolean)) {
+        edges.push({ from: mon, to: name, type: "monitor" });
+      }
+    }
+
+    // Monitors (this process monitors someone)
+    if (monsStr) {
+      for (const mon of monsStr.split(",").filter(Boolean)) {
+        edges.push({ from: name, to: mon, type: "monitor" });
+      }
+    }
+  }
+
+  // Deduplicate monitor edges
+  const edgeKeys = new Set<string>();
+  const dedupedEdges: GraphEdge[] = [];
+  for (const e of edges) {
+    const key = `${e.from}|${e.to}|${e.type}`;
+    if (!edgeKeys.has(key)) {
+      edgeKeys.add(key);
+      dedupedEdges.push(e);
+    }
+  }
+
+  return { graphNodes, edges: dedupedEdges };
+}
+
+// get-topology
+server.tool(
+  {
+    name: "get-topology",
+    description: "Show the process topology graph for a BEAM node — registered processes as nodes, links/monitors as edges",
+    schema: z.object({
+      name: z.string().describe("Short name of the target node"),
+    }),
+    widget: {
+      name: "process-topology",
+      invoking: "Building topology graph...",
+      invoked: "Topology graph ready",
+    },
+  },
+  async ({ name }) => {
+    const guard = configGuard();
+    if (guard) return guard;
+
+    const node = nodes.get(name);
+    if (!node) return error(`Node "${name}" not found. Use list-nodes to see active nodes.`);
+    if (node.status !== "running") return error(`Node "${name}" is not running (status: ${node.status}).`);
+
+    let output: string;
+    try {
+      output = await rpcRaw(name, node.cookie, topologyErlCode(), node.hostLabel);
+    } catch (err) {
+      return error(`Failed to get topology: ${err instanceof Error ? err.message : "Unknown error"}`);
+    }
+
+    const { graphNodes, edges } = parseTopologyOutput(output);
+    const traceActive = activeTraces.has(name);
+
+    const summary = `${graphNodes.length} processes, ${edges.length} edges${traceActive ? " (tracing active)" : ""}`;
+
+    return widget({
+      props: { nodeName: name, graphNodes, edges, traceActive, traceEdges: [] as TraceEdge[] },
+      output: text(`Topology for "${name}": ${summary}`),
+    });
+  }
+);
+
+// start-trace
+server.tool(
+  {
+    name: "start-trace",
+    description: "Start message tracing on a BEAM node to capture inter-process communication",
+    schema: z.object({
+      name: z.string().describe("Short name of the target node"),
+    }),
+  },
+  async ({ name }) => {
+    const guard = configGuard();
+    if (guard) return guard;
+
+    const node = nodes.get(name);
+    if (!node) return error(`Node "${name}" not found. Use list-nodes to see active nodes.`);
+    if (node.status !== "running") return error(`Node "${name}" is not running (status: ${node.status}).`);
+
+    if (activeTraces.has(name)) return text(`Tracing is already active on "${name}".`);
+
+    const erlCode = `
+      case whereis(mcp_tracer) of
+        undefined ->
+          Pid = spawn(fun() ->
+            ets:new(mcp_trace_edges, [set, public, named_table]),
+            register(mcp_tracer, self()),
+            erlang:trace(all, true, [send, {tracer, self()}]),
+            TracerLoop = fun Loop() ->
+              receive
+                {trace, FromPid, send, _Msg, ToPid} ->
+                  Names = erlang:registered(),
+                  FromName = case is_pid(FromPid) of
+                    true -> case [R || R <- Names, whereis(R) =:= FromPid] of [H|_] -> H; [] -> undefined end;
+                    false -> undefined
+                  end,
+                  ToName = case is_pid(ToPid) of
+                    true -> case [R || R <- Names, whereis(R) =:= ToPid] of [H|_] -> H; [] -> undefined end;
+                    false -> undefined
+                  end,
+                  case {FromName, ToName} of
+                    {undefined, _} -> ok;
+                    {_, undefined} -> ok;
+                    {F, T} ->
+                      try ets:update_counter(mcp_trace_edges, {F, T}, {2, 1})
+                      catch error:badarg -> ets:insert(mcp_trace_edges, {{F, T}, 1})
+                      end
+                  end,
+                  Loop();
+                stop ->
+                  erlang:trace(all, false, [send]),
+                  ets:delete(mcp_trace_edges),
+                  ok;
+                _ ->
+                  Loop()
+              end
+            end,
+            TracerLoop()
+          end),
+          io:format("started:~p", [Pid]);
+        ExistingPid ->
+          io:format("already_running:~p", [ExistingPid])
+      end
+    `.replace(/\n/g, " ");
+
+    let result: string;
+    try {
+      result = await rpcRaw(name, node.cookie, erlCode, node.hostLabel);
+    } catch (err) {
+      return error(`Failed to start trace: ${err instanceof Error ? err.message : "Unknown error"}`);
+    }
+
+    if (result.includes("started:") || result.includes("already_running:")) {
+      activeTraces.set(name, { nodeName: name, hostLabel: node.hostLabel, startedAt: Date.now() });
+      return text(`Tracing started on "${name}". Use poll-trace to read captured edges.`);
+    }
+
+    return error(`Unexpected result starting trace on "${name}": ${result}`);
+  }
+);
+
+// stop-trace
+server.tool(
+  {
+    name: "stop-trace",
+    description: "Stop message tracing on a BEAM node",
+    schema: z.object({
+      name: z.string().describe("Short name of the target node"),
+    }),
+  },
+  async ({ name }) => {
+    const guard = configGuard();
+    if (guard) return guard;
+
+    const node = nodes.get(name);
+    if (!node) return error(`Node "${name}" not found.`);
+    if (node.status !== "running") return error(`Node "${name}" is not running.`);
+
+    const erlCode = `
+      case whereis(mcp_tracer) of
+        undefined -> io:format("not_running");
+        Pid ->
+          Pid ! stop,
+          timer:sleep(100),
+          case is_process_alive(Pid) of
+            true -> exit(Pid, kill), io:format("force_killed");
+            false -> io:format("stopped")
+          end
+      end
+    `.replace(/\n/g, " ");
+
+    let result: string;
+    try {
+      result = await rpcRaw(name, node.cookie, erlCode, node.hostLabel);
+    } catch (err) {
+      return error(`Failed to stop trace: ${err instanceof Error ? err.message : "Unknown error"}`);
+    }
+
+    activeTraces.delete(name);
+    return text(`Tracing stopped on "${name}" (${result}).`);
+  }
+);
+
+// poll-trace
+server.tool(
+  {
+    name: "poll-trace",
+    description: "Poll topology and trace data from a BEAM node (combines topology graph with traced message edges)",
+    schema: z.object({
+      name: z.string().describe("Short name of the target node"),
+    }),
+    widget: {
+      name: "process-topology",
+      invoking: "Polling trace data...",
+      invoked: "Trace data ready",
+    },
+  },
+  async ({ name }) => {
+    const guard = configGuard();
+    if (guard) return guard;
+
+    const node = nodes.get(name);
+    if (!node) return error(`Node "${name}" not found.`);
+    if (node.status !== "running") return error(`Node "${name}" is not running.`);
+
+    // Topology + trace data in one RPC
+    const erlCode = topologyErlCode().replace("ok", `
+      case ets:info(mcp_trace_edges) of
+        undefined -> ok;
+        _ ->
+          Edges = ets:tab2list(mcp_trace_edges),
+          ets:delete_all_objects(mcp_trace_edges),
+          lists:foreach(fun({{From, To}, Count}) ->
+            io:format("TRACE|~s|~s|~p~n", [atom_to_list(From), atom_to_list(To), Count])
+          end, Edges)
+      end,
+      case whereis(mcp_tracer) of
+        undefined -> io:format("TRACER_STATUS|stopped~n");
+        _ -> io:format("TRACER_STATUS|running~n")
+      end,
+      ok
+    `.replace(/\n/g, " "));
+
+    let output: string;
+    try {
+      output = await rpcRaw(name, node.cookie, erlCode, node.hostLabel);
+    } catch (err) {
+      return error(`Failed to poll trace: ${err instanceof Error ? err.message : "Unknown error"}`);
+    }
+
+    const { graphNodes, edges } = parseTopologyOutput(output);
+
+    // Parse trace edges
+    const traceEdges: TraceEdge[] = [];
+    for (const line of output.split("\n")) {
+      if (!line.startsWith("TRACE|")) continue;
+      const parts = line.split("|");
+      if (parts.length < 4) continue;
+      traceEdges.push({
+        from: parts[1],
+        to: parts[2],
+        count: parseInt(parts[3], 10) || 0,
+      });
+    }
+
+    // Check tracer status
+    let traceActive = activeTraces.has(name);
+    if (output.includes("TRACER_STATUS|stopped")) {
+      activeTraces.delete(name);
+      traceActive = false;
+    }
+
+    const summary = `${graphNodes.length} processes, ${edges.length} edges, ${traceEdges.length} trace edges${traceActive ? " (tracing)" : ""}`;
+
+    return widget({
+      props: { nodeName: name, graphNodes, edges, traceActive, traceEdges },
+      output: text(`Topology for "${name}": ${summary}`),
+    });
   }
 );
 
