@@ -28,10 +28,12 @@ const API_KEY = process.env.API_KEY || "";
 if (API_KEY) {
   server.app.use("/mcp/*", async (c, next) => {
     const auth = c.req.header("Authorization");
-    if (!auth || auth !== `Bearer ${API_KEY}`) {
+    const queryKey = new URL(c.req.url).searchParams.get("api_key");
+    if (auth === `Bearer ${API_KEY}` || queryKey === API_KEY) {
+      await next();
+    } else {
       return c.json({ error: "Unauthorized" }, 401);
     }
-    await next();
   });
 }
 
