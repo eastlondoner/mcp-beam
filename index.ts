@@ -207,6 +207,24 @@ interface ManagedNode {
 
 const nodes = new Map<string, ManagedNode>();
 
+// ── GenServer Tracking ──────────────────────────────────────────────────────
+
+interface TrackedGenServer {
+  nodeName: string;
+  module: string;
+  registerAs: string | null;
+  args: string;
+  startedAt: number;
+}
+
+const trackedGenServers = new Map<string, TrackedGenServer>();
+
+function clearTrackedForNode(nodeName: string): void {
+  for (const key of trackedGenServers.keys()) {
+    if (key.startsWith(`${nodeName}:`)) trackedGenServers.delete(key);
+  }
+}
+
 function getDefaultHostLabel(): string | null {
   const first = sshHosts.keys().next();
   return first.done ? null : first.value;
@@ -413,6 +431,7 @@ server.tool(
 
     try { node.channel.close(); } catch {}
     nodes.delete(name);
+    clearTrackedForNode(name);
 
     return text(`Stopped and removed node "${name}@${node.remoteShortHost}" on host "${node.hostLabel}".`);
   }
@@ -609,6 +628,13 @@ server.tool(
 
 const atomNameRegex = /^[a-zA-Z_][a-zA-Z0-9_.:]*$/;
 
+function classifyProcess(currentFunction: string): "genserver" | "supervisor" | "genstatem" | "system" {
+  if (currentFunction.startsWith("gen_server:loop")) return "genserver";
+  if (currentFunction.startsWith("supervisor:main_loop")) return "supervisor";
+  if (currentFunction.startsWith("gen_statem:loop")) return "genstatem";
+  return "system";
+}
+
 // deploy-module
 server.tool(
   {
@@ -737,6 +763,19 @@ server.tool(
       return error(`Failed to start GenServer: ${err instanceof Error ? err.message : "Unknown error"}`);
     }
 
+    if (result.includes("{ok,")) {
+      const key = registerAs
+        ? `${name}:${registerAs}`
+        : `${name}:${module}:${Date.now()}`;
+      trackedGenServers.set(key, {
+        nodeName: name,
+        module,
+        registerAs: registerAs || null,
+        args,
+        startedAt: Date.now(),
+      });
+    }
+
     return text(`GenServer start result on "${name}":\n${result}`);
   }
 );
@@ -811,7 +850,121 @@ server.tool(
       return error(`Failed to stop GenServer: ${err instanceof Error ? err.message : "Unknown error"}`);
     }
 
+    trackedGenServers.delete(`${name}:${serverName}`);
+
     return text(`GenServer stop result on "${name}": ${result}`);
+  }
+);
+
+// show-genservers
+server.tool(
+  {
+    name: "show-genservers",
+    description: "Show all GenServers running across all managed BEAM nodes, with tracking info for ones started via MCP",
+    schema: z.object({}),
+    widget: {
+      name: "genserver-dashboard",
+      invoking: "Querying GenServers...",
+      invoked: "GenServer dashboard ready",
+    },
+  },
+  async () => {
+    const guard = configGuard();
+    if (guard) return guard;
+
+    const nodeResults: Array<{
+      name: string;
+      type: "erlang" | "elixir";
+      status: string;
+      genservers: Array<{
+        name: string;
+        status: string;
+        messageQueueLen: number;
+        memory: number;
+        currentFunction: string;
+        tracked: boolean;
+        module: string | null;
+        args: string | null;
+        startedAt: number | null;
+      }>;
+    }> = [];
+
+    for (const [name, node] of nodes) {
+      if (node.status !== "running") {
+        nodeResults.push({ name, type: node.type, status: node.status, genservers: [] });
+        continue;
+      }
+
+      // Reuse same Erlang RPC as inspect-node
+      const erlCode = `
+        Names = erlang:registered(),
+        lists:foreach(fun(N) ->
+          Pid = whereis(N),
+          case Pid of
+            undefined -> ok;
+            _ ->
+              Info = erlang:process_info(Pid, [status, message_queue_len, memory, current_function]),
+              case Info of
+                undefined -> ok;
+                _ ->
+                  Status = proplists:get_value(status, Info),
+                  MQL = proplists:get_value(message_queue_len, Info),
+                  Mem = proplists:get_value(memory, Info),
+                  {M, F, A} = proplists:get_value(current_function, Info),
+                  io:format("~s|~s|~p|~p|~s:~s/~p~n", [
+                    atom_to_list(N),
+                    atom_to_list(Status),
+                    MQL,
+                    Mem,
+                    atom_to_list(M),
+                    atom_to_list(F),
+                    A
+                  ])
+              end
+          end
+        end, Names),
+        ok
+      `.replace(/\n/g, " ");
+
+      try {
+        const output = await rpcRaw(name, node.cookie, erlCode, node.hostLabel);
+        const processes = output
+          .split("\n")
+          .filter((line) => line.includes("|"))
+          .map((line) => {
+            const [pName, status, mqLen, memory, currentFn] = line.split("|");
+            return { name: pName, status, messageQueueLen: parseInt(mqLen, 10) || 0, memory: parseInt(memory, 10) || 0, currentFunction: currentFn };
+          })
+          .filter((p) => classifyProcess(p.currentFunction) === "genserver");
+
+        const genservers = processes.map((p) => {
+          const trackKey = `${name}:${p.name}`;
+          const tracked = trackedGenServers.get(trackKey);
+          return {
+            ...p,
+            tracked: !!tracked,
+            module: tracked?.module ?? null,
+            args: tracked?.args ?? null,
+            startedAt: tracked?.startedAt ?? null,
+          };
+        });
+
+        nodeResults.push({ name, type: node.type, status: "running", genservers });
+      } catch {
+        nodeResults.push({ name, type: node.type, status: "unreachable", genservers: [] });
+      }
+    }
+
+    const totalGs = nodeResults.reduce((s, n) => s + n.genservers.length, 0);
+    const managedGs = nodeResults.reduce((s, n) => s + n.genservers.filter((g) => g.tracked).length, 0);
+    const summary = nodeResults.length === 0
+      ? "No managed nodes."
+      : `${totalGs} GenServer(s) across ${nodeResults.length} node(s), ${managedGs} managed via MCP`;
+
+    return widget({
+      props: { nodes: nodeResults },
+      output: text(summary),
+    });
   }
 );
 
@@ -842,6 +995,7 @@ server.tool(
     // Stop the existing node
     try { node.channel.close(); } catch {}
     nodes.delete(name);
+    clearTrackedForNode(name);
 
     // Re-launch with the same config
     let conn: Client;
