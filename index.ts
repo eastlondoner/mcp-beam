@@ -172,6 +172,12 @@ function sshExecLongRunning(conn: Client, command: string): Promise<ClientChanne
   });
 }
 
+async function sshWriteFile(hostLabel: string, remotePath: string, content: string): Promise<void> {
+  const conn = await getSSHConnection(hostLabel);
+  const b64 = Buffer.from(content, "utf-8").toString("base64");
+  await sshExecSimple(conn, `printf '%s' ${shellEscape(b64)} | base64 -d > ${shellEscape(remotePath)}`);
+}
+
 // ── Shell Escaping ──────────────────────────────────────────────────────────
 
 function shellEscape(s: string): string {
@@ -233,7 +239,7 @@ process.on("SIGTERM", () => { cleanup(); process.exit(0); });
 
 // ── RPC Helpers ─────────────────────────────────────────────────────────────
 
-async function rpcCall(targetNode: string, cookie: string, erlCode: string, hostLabel: string): Promise<string> {
+async function rpcCall(targetNode: string, cookie: string, erlCode: string, hostLabel: string, timeout: number = 10_000): Promise<string> {
   const conn = await getSSHConnection(hostLabel);
   const hostConfig = sshHosts.get(hostLabel)!;
   const erlPath = hostConfig.erlPath;
@@ -241,7 +247,6 @@ async function rpcCall(targetNode: string, cookie: string, erlCode: string, host
 
   const tmpName = `mcptmp_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
   const fullTarget = `${targetNode}@${shortHost}`;
-  const fullTmp = `${tmpName}@${shortHost}`;
 
   const wrappedCode = `
     case net_adm:ping('${fullTarget}') of
@@ -256,10 +261,10 @@ async function rpcCall(targetNode: string, cookie: string, erlCode: string, host
   `.replace(/\n/g, " ");
 
   const command = `${erlPath} -sname ${tmpName} -setcookie ${cookie} -noshell -eval ${shellEscape(wrappedCode)}`;
-  return sshExecSimple(conn, command, 10_000);
+  return sshExecSimple(conn, command, timeout);
 }
 
-async function rpcRaw(targetNode: string, cookie: string, erlCode: string, hostLabel: string): Promise<string> {
+async function rpcRaw(targetNode: string, cookie: string, erlCode: string, hostLabel: string, timeout: number = 10_000): Promise<string> {
   const conn = await getSSHConnection(hostLabel);
   const hostConfig = sshHosts.get(hostLabel)!;
   const erlPath = hostConfig.erlPath;
@@ -280,7 +285,7 @@ async function rpcRaw(targetNode: string, cookie: string, erlCode: string, hostL
   `.replace(/\n/g, " ");
 
   const command = `${erlPath} -sname ${tmpName} -setcookie ${cookie} -noshell -eval ${shellEscape(wrappedCode)}`;
-  return sshExecSimple(conn, command, 10_000);
+  return sshExecSimple(conn, command, timeout);
 }
 
 // ── Tools ───────────────────────────────────────────────────────────────────
@@ -549,6 +554,216 @@ server.tool(
       },
       output: text(summary),
     });
+  }
+);
+
+// ── Atom name validation ────────────────────────────────────────────────────
+
+const atomNameRegex = /^[a-zA-Z_][a-zA-Z0-9_.:]*$/;
+
+// deploy-module
+server.tool(
+  {
+    name: "deploy-module",
+    description: "Compile and hot-load an Erlang or Elixir module onto a running BEAM node from source code",
+    schema: z.object({
+      name: z.string().describe("Short name of the target node"),
+      code: z.string().describe("Full source code of the module"),
+      language: z.enum(["erlang", "elixir"]).describe("Source language: erlang or elixir"),
+    }),
+  },
+  async ({ name, code, language }) => {
+    const guard = configGuard();
+    if (guard) return guard;
+
+    const node = nodes.get(name);
+    if (!node) {
+      return error(`Node "${name}" not found. Use list-nodes to see active nodes.`);
+    }
+    if (node.status !== "running") {
+      return error(`Node "${name}" is not running (status: ${node.status}).`);
+    }
+
+    const ts = Date.now();
+    const ext = language === "erlang" ? "erl" : "ex";
+    const remotePath = `/tmp/mcp_deploy_${ts}.${ext}`;
+
+    try {
+      await sshWriteFile(node.hostLabel, remotePath, code);
+    } catch (err) {
+      return error(`Failed to write source file: ${err instanceof Error ? err.message : "Unknown error"}`);
+    }
+
+    let result: string;
+    try {
+      if (language === "erlang") {
+        const erlCode = `
+          case compile:file("${remotePath}", [binary, return_errors]) of
+            {ok, Mod, Bin} ->
+              {module, Mod} = code:load_binary(Mod, "${remotePath}", Bin),
+              Exports = Mod:module_info(exports),
+              file:delete("${remotePath}"),
+              {ok, Mod, Exports};
+            {error, Errors, _Warnings} ->
+              file:delete("${remotePath}"),
+              {error, Errors}
+          end
+        `.replace(/\n/g, " ");
+        result = await rpcCall(name, node.cookie, erlCode, node.hostLabel);
+      } else {
+        const erlCode = `
+          try
+            Modules = 'Elixir.Code':compile_file(<<"${remotePath}">>),
+            file:delete("${remotePath}"),
+            Results = lists:map(fun({Mod, _Bin}) ->
+              Exports = Mod:module_info(exports),
+              {Mod, Exports}
+            end, Modules),
+            {ok, Results}
+          catch
+            Class:Reason ->
+              file:delete("${remotePath}"),
+              {error, {Class, Reason}}
+          end
+        `.replace(/\n/g, " ");
+        result = await rpcCall(name, node.cookie, erlCode, node.hostLabel);
+      }
+    } catch (err) {
+      // Attempt cleanup on SSH-level failure
+      try {
+        const conn = await getSSHConnection(node.hostLabel);
+        await sshExecSimple(conn, `rm -f ${shellEscape(remotePath)}`, 5000);
+      } catch {}
+      return error(`Failed to deploy module: ${err instanceof Error ? err.message : "Unknown error"}`);
+    }
+
+    return text(`Deploy result on "${name}":\n${result}`);
+  }
+);
+
+// start-genserver
+server.tool(
+  {
+    name: "start-genserver",
+    description: "Start a GenServer on a running BEAM node (uses gen_server:start, not start_link)",
+    schema: z.object({
+      name: z.string().describe("Short name of the target node"),
+      module: z.string().regex(atomNameRegex).describe("Module atom name (e.g. 'counter')"),
+      args: z.string().default("[]").describe("Init argument as an Erlang term string (default: '[]')"),
+      registerAs: z.string().regex(atomNameRegex).optional().describe("Optional: register the GenServer under this name"),
+    }),
+  },
+  async ({ name, module, args, registerAs }) => {
+    const guard = configGuard();
+    if (guard) return guard;
+
+    const node = nodes.get(name);
+    if (!node) {
+      return error(`Node "${name}" not found. Use list-nodes to see active nodes.`);
+    }
+    if (node.status !== "running") {
+      return error(`Node "${name}" is not running (status: ${node.status}).`);
+    }
+
+    let erlCode: string;
+    if (registerAs) {
+      erlCode = `
+        case gen_server:start({local, '${registerAs}'}, '${module}', ${args}, []) of
+          {ok, Pid} -> {ok, Pid, '${registerAs}'};
+          {error, Reason} -> {error, Reason}
+        end
+      `.replace(/\n/g, " ");
+    } else {
+      erlCode = `
+        case gen_server:start('${module}', ${args}, []) of
+          {ok, Pid} -> {ok, Pid};
+          {error, Reason} -> {error, Reason}
+        end
+      `.replace(/\n/g, " ");
+    }
+
+    let result: string;
+    try {
+      result = await rpcCall(name, node.cookie, erlCode, node.hostLabel);
+    } catch (err) {
+      return error(`Failed to start GenServer: ${err instanceof Error ? err.message : "Unknown error"}`);
+    }
+
+    return text(`GenServer start result on "${name}":\n${result}`);
+  }
+);
+
+// call-genserver
+server.tool(
+  {
+    name: "call-genserver",
+    description: "Make a synchronous gen_server:call to a registered GenServer on a BEAM node",
+    schema: z.object({
+      name: z.string().describe("Short name of the target node"),
+      server: z.string().regex(atomNameRegex).describe("Registered name of the GenServer"),
+      message: z.string().describe("Call message as an Erlang term string (e.g. 'get' or '{add, 5}')"),
+      timeout: z.number().int().min(1).max(60000).default(5000).describe("GenServer call timeout in ms (default: 5000)"),
+    }),
+  },
+  async ({ name, server: serverName, message, timeout: callTimeout }) => {
+    const guard = configGuard();
+    if (guard) return guard;
+
+    const node = nodes.get(name);
+    if (!node) {
+      return error(`Node "${name}" not found. Use list-nodes to see active nodes.`);
+    }
+    if (node.status !== "running") {
+      return error(`Node "${name}" is not running (status: ${node.status}).`);
+    }
+
+    const sshTimeout = Math.max(callTimeout + 5000, 10_000);
+
+    const erlCode = `gen_server:call('${serverName}', ${message}, ${callTimeout})`.replace(/\n/g, " ");
+
+    let result: string;
+    try {
+      result = await rpcCall(name, node.cookie, erlCode, node.hostLabel, sshTimeout);
+    } catch (err) {
+      return error(`GenServer call failed: ${err instanceof Error ? err.message : "Unknown error"}`);
+    }
+
+    return text(`GenServer call result:\n${result}`);
+  }
+);
+
+// stop-genserver
+server.tool(
+  {
+    name: "stop-genserver",
+    description: "Gracefully stop a registered GenServer on a BEAM node",
+    schema: z.object({
+      name: z.string().describe("Short name of the target node"),
+      server: z.string().regex(atomNameRegex).describe("Registered name of the GenServer to stop"),
+    }),
+  },
+  async ({ name, server: serverName }) => {
+    const guard = configGuard();
+    if (guard) return guard;
+
+    const node = nodes.get(name);
+    if (!node) {
+      return error(`Node "${name}" not found. Use list-nodes to see active nodes.`);
+    }
+    if (node.status !== "running") {
+      return error(`Node "${name}" is not running (status: ${node.status}).`);
+    }
+
+    const erlCode = `gen_server:stop('${serverName}', normal, 5000)`.replace(/\n/g, " ");
+
+    let result: string;
+    try {
+      result = await rpcCall(name, node.cookie, erlCode, node.hostLabel);
+    } catch (err) {
+      return error(`Failed to stop GenServer: ${err instanceof Error ? err.message : "Unknown error"}`);
+    }
+
+    return text(`GenServer stop result on "${name}": ${result}`);
   }
 );
 
