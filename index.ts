@@ -184,6 +184,14 @@ function shellEscape(s: string): string {
   return "'" + s.replace(/'/g, "'\\''") + "'";
 }
 
+/** Build a PATH= prefix so that `erl` is discoverable by scripts like `elixir`. */
+function pathPrefixFor(hostConfig: SSHHostConfig): string {
+  const dir = hostConfig.erlPath.includes("/")
+    ? hostConfig.erlPath.slice(0, hostConfig.erlPath.lastIndexOf("/"))
+    : "";
+  return dir ? `PATH=${shellEscape(dir)}:$PATH ` : "";
+}
+
 // ── State ───────────────────────────────────────────────────────────────────
 
 interface ManagedNode {
@@ -260,7 +268,8 @@ async function rpcCall(targetNode: string, cookie: string, erlCode: string, host
     end.
   `.replace(/\n/g, " ");
 
-  const command = `${erlPath} -sname ${tmpName} -setcookie ${cookie} -noshell -eval ${shellEscape(wrappedCode)}`;
+  const pathPrefix = pathPrefixFor(hostConfig);
+  const command = `${pathPrefix}${erlPath} -sname ${tmpName} -setcookie ${cookie} -noshell -eval ${shellEscape(wrappedCode)}`;
   return sshExecSimple(conn, command, timeout);
 }
 
@@ -284,7 +293,8 @@ async function rpcRaw(targetNode: string, cookie: string, erlCode: string, hostL
     end.
   `.replace(/\n/g, " ");
 
-  const command = `${erlPath} -sname ${tmpName} -setcookie ${cookie} -noshell -eval ${shellEscape(wrappedCode)}`;
+  const pathPrefix = pathPrefixFor(hostConfig);
+  const command = `${pathPrefix}${erlPath} -sname ${tmpName} -setcookie ${cookie} -noshell -eval ${shellEscape(wrappedCode)}`;
   return sshExecSimple(conn, command, timeout);
 }
 
@@ -326,11 +336,12 @@ server.tool(
     const cookie = cookieArg || await defaultCookie(hostLabel);
     const shortHost = hostConfig.remoteShortHost;
 
+    const pathPrefix = pathPrefixFor(hostConfig);
     let command: string;
     if (type === "erlang") {
-      command = `${hostConfig.erlPath} -sname ${name} -setcookie ${cookie} -noshell`;
+      command = `${pathPrefix}${hostConfig.erlPath} -sname ${name} -setcookie ${cookie} -noshell`;
     } else {
-      command = `${hostConfig.elixirPath} --sname ${name} --cookie ${cookie} --no-halt`;
+      command = `${pathPrefix}${hostConfig.elixirPath} --sname ${name} --cookie ${cookie} --no-halt`;
     }
 
     let channel: ClientChannel;
@@ -366,7 +377,7 @@ server.tool(
         const tmpName = `mcpchk_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
         const fullTarget = `${name}@${shortHost}`;
         const evalCode = `case net_adm:ping('${fullTarget}') of pong -> io:format("pong"), init:stop(0); pang -> io:format("pang"), init:stop(1) end.`;
-        const pingCmd = `${hostConfig.erlPath} -sname ${tmpName} -setcookie ${cookie} -noshell -eval ${shellEscape(evalCode)}`;
+        const pingCmd = `${pathPrefix}${hostConfig.erlPath} -sname ${tmpName} -setcookie ${cookie} -noshell -eval ${shellEscape(evalCode)}`;
         const result = await sshExecSimple(pingConn, pingCmd, 5000);
         const nn = nodes.get(name);
         if (nn && nn.status === "starting") {
